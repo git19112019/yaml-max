@@ -1,221 +1,557 @@
-#FROM python:3.13.5-slim
-FROM python:3.14.0b3-alpine3.21
-LABEL maintainer="you@example.com"
-LABEL description="yamlx workflow CLI tool - full-featured"
+# Multi-stage build for minimal image size
+FROM python:3.12-alpine3.19 AS builder
+
+# Build dependencies
+RUN apk add --no-cache gcc musl-dev libffi-dev openssl-dev python3-dev
+
+WORKDIR /build
+
+# Create requirements.txt
+RUN cat <<EOF > requirements.txt
+pyyaml==6.0.1
+jinja2==3.1.2
+requests==2.31.0
+aiohttp==3.9.1
+asyncio==3.4.3
+openai==0.28.0
+anthropic==0.8.1
+prometheus-client==0.19.0
+python-dotenv==1.0.0
+colorama==0.4.6
+rich==13.7.0
+tenacity==8.2.3
+pydantic==2.5.3
+jsonschema==4.20.0
+EOF
+
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+
+# Runtime stage
+FROM python:3.12-alpine3.19
+
+LABEL maintainer="llms-os@example.com" \
+      version="2.0.0" \
+      description="Enhanced LLMs_OS with monitoring"
+
+# Install runtime dependencies
+RUN apk add --no-cache libffi openssl curl && \
+    adduser -D -u 1000 appuser
 
 WORKDIR /app
 
-# Cài hệ thống
-#RUN apt-get update && apt-get install -y --no-install-recommends \
-#    build-essential curl \
-# && rm -rf /var/lib/apt/lists/*
+# Copy wheels and install
+COPY --from=builder /build/wheels /wheels
+RUN pip install --no-cache /wheels/*
 
-# Cài Python packages
-RUN pip install --no-cache-dir pyyaml requests jinja2
+# Create application structure
+RUN mkdir -p /app/LLMs_OS/actions
 
-# Tạo thư mục module
-RUN mkdir -p /app/yamlx/actions
-WORKDIR /app/yamlx
+# Build LLMs_OS module
+WORKDIR /app/LLMs_OS
 
 # __init__.py
-RUN touch __init__.py && touch actions/__init__.py
+RUN cat <<EOF > __init__.py
+"""LLMs_OS - Enhanced Workflow Automation System"""
+__version__ = "2.0.0"
+__author__ = "LLMs_OS Team"
+
+from .core import execute_yaml
+from .async_core import execute_yaml_async
+from .cli import main
+from .registry import register, get_action, list_actions
+
+__all__ = [
+    'execute_yaml',
+    'execute_yaml_async',
+    'main',
+    'register',
+    'get_action',
+    'list_actions'
+]
+EOF
+
+# exceptions.py
+RUN cat <<EOF > exceptions.py
+"""Custom exceptions for LLMs_OS"""
+
+class LLMsOSException(Exception):
+    """Base exception for LLMs_OS"""
+    pass
+
+class ActionNotFoundError(LLMsOSException):
+    """Action not found in registry"""
+    pass
+
+class ValidationError(LLMsOSException):
+    """YAML validation error"""
+    pass
+
+class ExecutionError(LLMsOSException):
+    """Action execution error"""
+    pass
+EOF
 
 # registry.py
 RUN cat <<EOF > registry.py
-ACTION_REGISTRY = {}
+"""Action registry for LLMs_OS"""
+
+_ACTIONS = {}
 
 def register(name):
-    def wrapper(func):
-        ACTION_REGISTRY[name] = func
+    """Decorator to register an action"""
+    def decorator(func):
+        _ACTIONS[name] = func
         return func
-    return wrapper
+    return decorator
 
 def get_action(name):
-    return ACTION_REGISTRY.get(name)
+    """Get an action by name"""
+    if name not in _ACTIONS:
+        raise KeyError(f"Action not found: {name}")
+    return _ACTIONS[name]
+
+def list_actions():
+    """List all registered actions"""
+    return list(_ACTIONS.keys())
+EOF
+
+# monitoring.py
+RUN cat <<EOF > monitoring.py
+"""Monitoring and metrics for LLMs_OS"""
+from prometheus_client import Counter, Histogram, start_http_server
+import time
+
+task_counter = Counter('llms_os_tasks_total', 'Total tasks executed', ['action', 'status'])
+task_duration = Histogram('llms_os_task_duration_seconds', 'Task execution time', ['action'])
+
+def start_metrics_server(port=9090):
+    """Start Prometheus metrics server"""
+    try:
+        start_http_server(port)
+    except Exception:
+        pass
+
+def record_task(action, status, duration=0):
+    """Record task metrics"""
+    task_counter.labels(action=action, status=status).inc()
+    if duration > 0:
+        task_duration.labels(action=action).observe(duration)
+EOF
+
+# validators.py
+RUN cat <<EOF > validators.py
+"""YAML validation for LLMs_OS"""
+import jsonschema
+
+WORKFLOW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metadata": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "version": {"type": "string"}
+            }
+        },
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"}
+                }
+            }
+        }
+    },
+    "required": ["tasks"]
+}
+
+def validate_workflow(data):
+    """Validate workflow YAML structure"""
+    try:
+        jsonschema.validate(instance=data, schema=WORKFLOW_SCHEMA)
+        return True
+    except jsonschema.exceptions.ValidationError as e:
+        raise ValueError(f"Invalid workflow: {e.message}")
 EOF
 
 # core.py
 RUN cat <<EOF > core.py
-import yaml, importlib, os
-from jinja2 import Template
-from yamlx.registry import get_action
+"""Core workflow execution engine"""
+import yaml
+import os
+from pathlib import Path
+from .registry import get_action
 
-def render(value):
-    return Template(value).render(env=os.environ)
+def execute_yaml(file_path: str) -> None:
+    """Execute a workflow from a YAML file"""
+    # Load workflow
+    with open(file_path, 'r') as f:
+        workflow = yaml.safe_load(f)
+    
+    # Import actions to ensure they're registered
+    import LLMs_OS.actions
+    
+    # Get tasks
+    tasks = workflow.get('tasks', [])
+    context = {}
+    
+    # Execute each task
+    for task in tasks:
+        action_name = task.get('action')
+        if not action_name:
+            continue
+        
+        try:
+            action = get_action(action_name)
+            result = action(task, context)
+            
+            # Save result if requested
+            if 'save_as' in task and result:
+                context[task['save_as']] = result
+        except Exception as e:
+            print(f"❌ Error in action '{action_name}': {e}")
+            raise
+EOF
 
-def load_actions():
-    path = os.path.join(os.path.dirname(__file__), "actions")
-    for f in os.listdir(path):
-        if f.endswith(".py") and not f.startswith("_"):
-            importlib.import_module(f"yamlx.actions." + f[:-3])
+# async_core.py
+RUN cat <<EOF > async_core.py
+"""Async workflow execution engine"""
+import yaml
+import asyncio
+from pathlib import Path
+from .registry import get_action
 
-def execute_yaml(file_path):
-    load_actions()
-    with open(file_path, "r") as f:
-        data = yaml.safe_load(f)
-    print("\\n📄", data.get("metadata", {}).get("title", "yamlx script"))
-    print("="*40)
-    for task in data.get("tasks", []):
-        action = task.get("action")
-        fn = get_action(action)
-        if fn:
-            try:
-                fn(task)
-            except Exception as e:
-                print(f"❌ Lỗi với action '{action}': {e}")
-        else:
-            print(f"⚠️ Action không hỗ trợ: {action}")
+async def execute_yaml_async(file_path: str) -> None:
+    """Execute a workflow from a YAML file asynchronously"""
+    # Load workflow
+    with open(file_path, 'r') as f:
+        workflow = yaml.safe_load(f)
+    
+    # Import actions to ensure they're registered
+    import LLMs_OS.actions
+    
+    # Get tasks
+    tasks = workflow.get('tasks', [])
+    context = {}
+    
+    # Execute each task
+    for task in tasks:
+        action_name = task.get('action')
+        if not action_name:
+            continue
+        
+        try:
+            action = get_action(action_name)
+            
+            # Check if action is async
+            if asyncio.iscoroutinefunction(action):
+                result = await action(task, context)
+            else:
+                result = action(task, context)
+            
+            # Save result if requested
+            if 'save_as' in task and result:
+                context[task['save_as']] = result
+        except Exception as e:
+            print(f"❌ Error in action '{action_name}': {e}")
+            raise
 EOF
 
 # cli.py
 RUN cat <<EOF > cli.py
-import argparse, os, sys
-from yamlx.core import execute_yaml
+"""Command-line interface for LLMs_OS"""
+import sys
+import argparse
+from pathlib import Path
+from .core import execute_yaml
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("yaml_file", help="Path to YAML script")
+    """Main CLI entry point"""
+    parser = argparse.ArgumentParser(description='LLMs_OS - Workflow automation with LLMs')
+    parser.add_argument('workflow', nargs='?', help='Path to workflow YAML file')
+    parser.add_argument('--version', action='store_true', help='Show version')
+    
     args = parser.parse_args()
-    if not os.path.exists(args.yaml_file):
-        print(f"❌ File không tồn tại: {args.yaml_file}")
-        sys.exit(1)
-    execute_yaml(args.yaml_file)
-EOF
-
-# setup.py
-RUN cat <<EOF > /app/setup.py
-from setuptools import setup, find_packages
-setup(
-    name="yamlx",
-    version="3.0.0",
-    packages=find_packages(),
-    install_requires=["pyyaml", "requests", "jinja2"],
-    entry_points={"console_scripts": ["yamlx = yamlx.cli:main"]},
-)
-EOF
-
-# Actions: print
-RUN cat <<EOF > actions/print_message.py
-from yamlx.registry import register
-@register("print_message")
-def _(task):
-    print("[PRINT]", task.get("message"))
-EOF
-
-# Actions: calculate
-RUN cat <<EOF > actions/calculate.py
-from yamlx.registry import register
-@register("calculate")
-def _(task):
-    op = task.get("operation")
-    nums = task.get("numbers", [])
-    if op == "add":
-        print("[CALC] Tổng:", sum(nums))
-    elif op == "multiply":
-        r = 1
-        for n in nums: r *= n
-        print("[CALC] Nhân:", r)
-    else:
-        print("[CALC] Không hỗ trợ:", op)
-EOF
-
-# Actions: shell
-RUN cat <<EOF > actions/run_command.py
-import subprocess
-from yamlx.registry import register
-from yamlx.core import render
-@register("run_command")
-def _(task):
-    cmd = render(task.get("command"))
-    print("[SHELL] ⇨", cmd)
-    subprocess.run(cmd, shell=True)
-EOF
-
-# Actions: file_write
-RUN cat <<EOF > actions/file_write.py
-from yamlx.registry import register
-@register("file_write")
-def _(task):
-    with open(task["filename"], "w") as f:
-        f.write(task["content"])
-    print("[WRITE] →", task["filename"])
-EOF
-
-# Actions: python_execute
-RUN cat <<EOF > actions/python_execute.py
-from yamlx.registry import register
-@register("python_execute")
-def _(task):
-    print("[PYTHON]")
+    
+    if args.version:
+        print('LLMs_OS v2.0.0')
+        return 0
+    
+    if not args.workflow:
+        parser.print_help()
+        return 1
+    
+    workflow_path = Path(args.workflow)
+    if not workflow_path.exists():
+        print(f"❌ Workflow file not found: {workflow_path}")
+        return 1
+    
     try:
-        exec(task.get("code", ""))
+        execute_yaml(str(workflow_path))
+        return 0
     except Exception as e:
-        print("⚠️ Python error:", e)
+        print(f"❌ Workflow execution failed: {e}")
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
 EOF
 
-# Actions: binary_execute
-RUN cat <<EOF > actions/binary_execute.py
-import base64, tempfile, subprocess, os
-from yamlx.registry import register
-@register("binary_execute")
-def _(task):
-    code = task.get("binary_code", "")
-    if isinstance(code, str):
-        code += "=" * ((4 - len(code) % 4) % 4)
-        code = base64.b64decode(code)
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(code)
-        path = f.name
-    os.chmod(path, 0o755)
-    print("[BIN] ⇨", path)
-    subprocess.run([path])
-    os.remove(path)
+# Actions __init__.py
+RUN cat <<EOF > actions/__init__.py
+"""Action modules"""
+from . import print_message
+from . import chat_completion
+from . import http_request
+from . import file_operations
+
+__all__ = ['print_message', 'chat_completion', 'http_request', 'file_operations']
+EOF
+
+# Actions: print_message
+RUN cat <<EOF > actions/print_message.py
+"""Print message action"""
+import re
+from ..registry import register
+
+COLORS = {
+    'success': '\\033[92m',
+    'error': '\\033[91m',
+    'warning': '\\033[93m',
+    'info': '\\033[94m',
+    'debug': '\\033[90m',
+    'reset': '\\033[0m'
+}
+
+@register('print_message')
+def print_message(task, context):
+    """Print a formatted message"""
+    message = task.get('message', '')
+    style = task.get('style', 'info')
+    
+    # Replace templates like {{ var }} or {{ var.attr }}
+    def replace_var(match):
+        var_path = match.group(1).strip()
+        
+        # Handle default values: {{ var | default('value') }}
+        if '|' in var_path:
+            var_part, default_part = var_path.split('|', 1)
+            var_path = var_part.strip()
+            # Extract default value from default('value')
+            default_match = re.search(r"default\\(['\"](.+?)['\"]\\)", default_part)
+            default_val = default_match.group(1) if default_match else ''
+        else:
+            default_val = ''
+        
+        # Navigate path (e.g., health_check.status_code)
+        parts = var_path.split('.')
+        value = context
+        for part in parts:
+            if isinstance(value, dict):
+                value = value.get(part)
+                if value is None:
+                    return default_val if default_val else match.group(0)
+            else:
+                return default_val if default_val else match.group(0)
+        
+        return str(value) if value is not None else default_val
+    
+    message = re.sub(r'\\{\\{\\s*(.+?)\\s*\\}\\}', replace_var, message)
+    
+    color = COLORS.get(style, COLORS['info'])
+    print(f"{color}{message}{COLORS['reset']}")
+    return None
+EOF
+
+# Actions: file_operations
+RUN cat <<EOF > actions/file_operations.py
+"""File operations actions"""
+from pathlib import Path
+from ..registry import register
+
+@register('file_read')
+def file_read(task, context):
+    """Read file content"""
+    path = task.get('path', '')
+    try:
+        with open(path, 'r') as f:
+            content = f.read()
+        return {'content': content}
+    except Exception as e:
+        print(f"⚠️  File read failed: {e}")
+        return None
+
+@register('file_write')
+def file_write(task, context):
+    """Write content to file"""
+    path = task.get('path', '')
+    content = task.get('content', '')
+    
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(content)
+        return {'path': path}
+    except Exception as e:
+        print(f"⚠️  File write failed: {e}")
+        return None
 EOF
 
 # Actions: http_request
 RUN cat <<EOF > actions/http_request.py
+"""HTTP request action"""
 import requests
-from yamlx.registry import register
-@register("http_request")
-def _(task):
-    method = task.get("method", "GET").upper()
-    url = task.get("url")
-    print("[HTTP]", method, url)
-    res = requests.request(method, url)
-    print("[RESP]", res.status_code)
-    print(res.text[:200])
+from ..registry import register
+
+@register('http_request')
+def http_request(task, context):
+    """Make HTTP request"""
+    url = task.get('url', '')
+    method = task.get('method', 'GET').upper()
+    headers = task.get('headers', {})
+    data = task.get('data')
+    
+    try:
+        response = requests.request(method, url, headers=headers, json=data)
+        return {
+            'status_code': response.status_code,
+            'headers': dict(response.headers),
+            'content': response.text
+        }
+    except Exception as e:
+        print(f"⚠️  HTTP request failed: {e}")
+        return None
 EOF
 
-# Sample YAML
-RUN cat <<EOF > /app/example.yaml
+# Actions: chat_completion
+RUN cat <<EOF > actions/chat_completion.py
+"""Chat completion action for LLM interactions"""
+import os
+from ..registry import register
+
+@register('chat_completion')
+def chat_completion(task, context):
+    """Execute LLM chat completion"""
+    provider = task.get('provider', 'openai')
+    model = task.get('model', 'gpt-3.5-turbo')
+    messages = task.get('messages', [])
+    
+    # Replace context variables in messages
+    import re
+    for msg in messages:
+        if 'content' in msg:
+            def replace_var(match):
+                var_path = match.group(1).strip()
+                parts = var_path.split('.')
+                value = context
+                for part in parts:
+                    if isinstance(value, dict):
+                        value = value.get(part)
+                        if value is None:
+                            return match.group(0)
+                    else:
+                        return match.group(0)
+                return str(value) if value is not None else match.group(0)
+            
+            msg['content'] = re.sub(r'\\{\\{\\s*(.+?)\\s*\\}\\}', replace_var, msg['content'])
+    
+    if provider == 'openai':
+        try:
+            import openai
+            openai.api_key = os.getenv('OPENAI_API_KEY')
+            response = openai.ChatCompletion.create(
+                model=model,
+                messages=messages
+            )
+            return {
+                'content': response.choices[0].message.content,
+                'model': model,
+                'provider': provider
+            }
+        except Exception as e:
+            print(f"⚠️  OpenAI request failed: {e}")
+            return None
+    
+    print(f"⚠️  Provider '{provider}' not supported")
+    return None
+EOF
+
+# pyproject.toml
+RUN cat <<EOF > /app/pyproject.toml
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LLMs_OS"
+version = "2.0.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+llms-os = "LLMs_OS.cli:main"
+
+[tool.setuptools]
+packages = ["LLMs_OS", "LLMs_OS.actions"]
+EOF
+
+# Sample YAML workflows
+RUN cat <<EOF > /app/example-workflow.yaml
 metadata:
-  title: "🌟 YAMLX All-in-One Demo"
+  title: "LLMs_OS Demo Workflow"
+  version: "2.0.0"
+  description: "Demonstration of LLMs_OS capabilities"
+
 tasks:
   - action: print_message
-    message: "🚀 Bắt đầu quy trình"
-  - action: calculate
-    operation: multiply
-    numbers: [2, 3, 4]
+    message: "🚀 Starting LLMs_OS workflow demonstration"
+    style: "success"
+
   - action: file_write
-    filename: hello.txt
-    content: "✅ File đã được ghi"
-  - action: run_command
-    command: "echo 'Hello from {{ env.USER }}'"
-  - action: python_execute
-    code: |
-      print("→ Python đang chạy:")
-      for i in range(2):
-          print("  Dòng", i)
+    path: /tmp/demo.txt
+    content: "Hello from LLMs_OS!"
+    save_as: file_info
+
+  - action: print_message
+    message: "✅ File created at {{ file_info.path }}"
+    style: "success"
+
+  - action: file_read
+    path: /tmp/demo.txt
+    save_as: file_content
+
+  - action: print_message
+    message: "📄 File content: {{ file_content.content }}"
+    style: "info"
+
   - action: http_request
     method: GET
-    url: https://httpbin.org/get
-  - action: binary_execute
-    binary_code: !!binary |
-      IyEvYmluL3NoCmVjaG8gIlxu4peEIEJpbmFyeSBydW4gdGltZSEiCg==
+    url: https://httpbin.org/json
+    save_as: http_response
+
+  - action: print_message
+    message: "🌐 HTTP Status: {{ http_response.status_code }}"
+    style: "info"
+
+  - action: print_message
+    message: "✨ Workflow completed successfully!"
+    style: "success"
 EOF
 
-# Install tool
+# Install package
 RUN pip install --no-cache-dir -e /app
 
-ENTRYPOINT ["yamlx"]
-CMD ["example.yaml"]
+# Change ownership
+RUN chown -R appuser:appuser /app
+
+# Security: Run as non-root
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import LLMs_OS; print('healthy')" || exit 1
+
+ENTRYPOINT ["llms-os"]
+CMD ["--help"]

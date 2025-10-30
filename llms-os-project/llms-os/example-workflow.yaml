@@ -1,0 +1,39 @@
+metadata:
+  title: "LLMs_OS Demo Workflow"
+  version: "2.0.0"
+  description: "Demonstration of LLMs_OS capabilities"
+
+tasks:
+  - action: print_message
+    message: "🚀 Starting LLMs_OS workflow demonstration"
+    style: "success"
+
+  - action: file_write
+    path: /tmp/demo.txt
+    content: "Hello from LLMs_OS!"
+    save_as: file_info
+
+  - action: print_message
+    message: "✅ File created at {{ file_info.path }}"
+    style: "success"
+
+  - action: file_read
+    path: /tmp/demo.txt
+    save_as: file_content
+
+  - action: print_message
+    message: "📄 File content: {{ file_content.content }}"
+    style: "info"
+
+  - action: http_request
+    method: GET
+    url: https://httpbin.org/json
+    save_as: http_response
+
+  - action: print_message
+    message: "🌐 HTTP Status: {{ http_response.status_code }}"
+    style: "info"
+
+  - action: print_message
+    message: "✨ Workflow completed successfully!"
+    style: "success"
